@@ -1,9 +1,10 @@
+from multiprocessing.sharedctypes import Value
 from posixpath import pathsep
-from pwn import process, context
 import glob
 import sys
 import argparse
 import os
+from os import path, chdir
 import glob
 import re
 import hashlib
@@ -11,10 +12,9 @@ import threading
 import multiprocessing
 from time import sleep
 import pickle
-import traceback
 import logging
 
-logging.getLogger("pwnlib").setLevel(logging.WARNING)
+from process import Process
 
 # Exceptions
 class TimeoutException(Exception):
@@ -23,39 +23,43 @@ class NoCrashException(Exception):
     pass
 # TODO: should not have written this as two separate classes
 class GDBJob:
-    def __init__(self, proc_name, filename, timeout=20):
-        START_PARSE = "---START_HERE---"
-        END_PARSE = "---END_HERE---"
+    def __init__(self, proc_name, filename,  timeout=20):
+        START_PARSE = "START_PARSING"
+        # random GDB command to act as an arbitrary stopping point during parsing
+        END_PARSE = "info win"
+
         self.filename = filename
         self.crashed = True
         self.timedout = False
-        exploitable_path = "/mnt/c/Users/pengjohn/Documents/tools/exploit/exploitable/exploitable/exploitable.py"
-        if env_exploitable := os.environ.get("EXPLOITABLE_PATH", None):
-            print("Using EXPLOITABLE path from environment")
-            self.exploitable_path = env_exploitable
-        context.log_level = "error"
-        gdb = process(["gdb", "--args", proc_name, filename], stdin=process.PTY, stdout=process.PTY, timeout=timeout)
+        # look for the exploitable plugin
+        exploitable_path = os.environ.get("EXPLOITABLE_PATH", None)
+        if not exploitable_path or not os.path.isfile(exploitable_path):
+            raise Exception(f"Please set EXPLOITABLE_PATH env variable to the path of exploitable.py")
+        gdb = Process(["gdb", "--args", proc_name, filename])
         # PWN complains when string encoding is not explicit
         # Need this or GDB will require user keystroke to display rest of output
-        gdb.sendline("set height unlimited".encode("utf-8"))
-        gdb.sendline("gef config context False".encode("utf-8"))
-        gdb.sendline("r".encode("utf-8"))
-        if not os.path.isfile(exploitable_path):
-            raise Exception(f"Exploitable not found at {exploitable_path}".encode("utf-8"))
-        gdb.sendline(f"source {exploitable_path}".encode("utf-8"))
-        gdb.sendline(f"p '{START_PARSE}'".encode("utf-8"))
-        gdb.sendline("exploitable -v".encode("utf-8"))
-        actions = [
-            "frame 2",
-            "p *next"
-        ]
+        gdb.write("set height unlimited\n")
+        gdb.write("gef config context False\n")
+        gdb.write("r\n")
+        gdb.write(f"source {exploitable_path}\n")
+        gdb.write(f"{START_PARSE}\n")
+        gdb.write("exploitable -v\n")
         # segfaulting address
-        gdb.sendline("SegfaultAddy".encode("utf-8"))
-        gdb.sendline("p $_siginfo._sifields._sigfault.si_addr".encode("utf-8"))
-        self.send(actions, gdb)
-        gdb.sendline(f"p '{END_PARSE}'".encode('utf-8'))
-        self.output = gdb.recvuntil(f"{END_PARSE}".encode("utf-8")).decode('utf-8').split('\n')
-        gdb.close()
+        gdb.write("p $_siginfo._sifields._sigfault.si_addr\n")
+        # send custom gdb commands
+        gdb.write(f"{END_PARSE}\n")
+        self.output = gdb.recvuntil(f"{END_PARSE}\n").decode('utf-8').split('\n')
+        # get source line info
+        gdb.write("list\n")
+        gdb.write(f"{END_PARSE}\n")
+        gdb.write("\n")
+        source_lines = gdb.recvuntil(f"{END_PARSE}\n").decode('utf-8').split('\r\n')
+        line_num = self.get_line_num(source_lines)
+        gdb.write("info line {}\n".format(line_num))
+        gdb.write(f"{END_PARSE}\n")
+        gdb.write("\n")
+        source_info_lines = gdb.recvuntil(f"{END_PARSE}\n").decode('utf-8').split('\r\n')
+        self.s_info = self.get_source_line(source_info_lines, line_num)
 
         if self.timedout == True:
             return
@@ -63,11 +67,30 @@ class GDBJob:
         for line in self.output:
             if "exited normally" in line:
                 self.crashed = False
+    
+    def get_source_line(self, sources, line_num):
+        match_str = f"Line {line_num} of"
+        for line in sources:
+            if match_str in line:
+                return line
+        return None
 
+    def get_line_num(self, sources):
+        numbers = []
+        for line in sources:
+            try:
+                line_num = int(line.split()[0])
+                numbers.append(line_num)
+            except ValueError:
+                continue
+            except IndexError:
+                continue
+        # TODO: not makes sure this is actually accurate
+        return numbers[int(len(numbers)/2)]        
     def send(self, actions, gdb):
         for action in actions:
-            gdb.sendline(action.encode("utf-8"))
-
+            gdb.write(action)
+        
     def generate_exploitable(self):
         if not self.crashed:
             print("{} did not crash".format(self.filename))
@@ -75,16 +98,18 @@ class GDBJob:
         elif self.timedout == True:
             print("{} timed out".format(self.filename))
             raise TimeoutException
-        return Exploitable(self.output, self.filename)
+        return Exploitable(self, self.filename)
 
 class Exploitable:
-    def __init__(self, output, crash_file):
-        START_PARSE = "---START_HERE---"
+    def __init__(self, gdb_output: GDBJob, crash_file):
+        START_PARSE = "START_PARSING"
+        END_PARSE = "info win"
         self.classification = []
         self.exploitable = False
         self.crash_file = crash_file
-        self._output = iter(output)
-        self.raw_output = output
+        self._output = iter(gdb_output.output)                       
+        self.raw_output = gdb_output.output
+        self.crash_line = gdb_output.s_info
         not_start = True
         line = next(self._output, None)
         while line or not_start:
@@ -98,14 +123,13 @@ class Exploitable:
                 self.faulting_frame = line.split(" ")[5]
             if "Description:" in line:
                 self.classification, line = self.parse_until("gef")
-            if "SegfaultAddy" in line:
+            if "p $_siginfo._sifields" in line:
                 self.segfault = self.parse_segfault()
             line = next(self._output, None)
-    
+
     def parse_segfault(self):
+        # segfault address is on the next line
         segfault = next(self._output, None)
-        if not segfault:
-            raise Exception("Error parsing segfault")
         match = re.search("(0x.*)", segfault)
         if match:
             return match.group(1)
@@ -115,13 +139,16 @@ class Exploitable:
         callstack_string = "".join(self.get_callstack()[:n])
         return hashlib.md5(callstack_string.encode("utf-8")).hexdigest()
 
-    def parse_until(self, stop_parse):
+    def parse_until(self, stop_parse, cb=None):
         trace = []
         line = next(self._output, None)
         if not line:
             raise Exception("Error parsing stacktrace")
         while line and stop_parse not in line:
-            trace.append(line)
+            if cb:
+                trace.append(cb(line))
+            else:
+                trace.append(line)
             line = next(self._output, None)
         return trace, line
 
@@ -145,15 +172,7 @@ class Exploitable:
         for descr in self.classification:
             print(descr)
         print("Segmentation Fault: ", self.segfault)
-
-    def print_results(self):
-        for line in self.disassembly:
-            print(line)
-        for line in self.get_callstack():
-            print(line)
-        for line in self.stack_trace[:self.callstack_lines]:
-            print(line)
-        print(self.segfault)
+        print("Crash line: ", self.crash_line)
 
 # threading
 def run_GDBWorker(filepath, i):
@@ -179,7 +198,13 @@ if __name__ == "__main__":
     argParse.add_argument("path", help="Path to the crash file, if relative path given, then must be ")
 
     arguments = argParse.parse_args()
-    executable = arguments.executable if arguments.executable else os.environ["CRASHWALK_BINARY"]
+    try:
+        executable = arguments.executable if arguments.executable else os.environ["CRASHWALK_BINARY"]
+    except KeyError:
+        print("Please set the env variable CRASHWALK_BINARY to the absolute path of the target binary\n")
+        print("Alternatively, provide it with the commandline option --executable\n")
+        sys.exit()
+
     path = arguments.path
 
     GDB_PROCS = multiprocessing.cpu_count()
@@ -204,9 +229,7 @@ if __name__ == "__main__":
         pass
 
     threads = []
-    # https://stackoverflow.com/questions/1466000/difference-between-modes-a-a-w-w-and-r-in-built-in-open-function
-    # FYI Python uses same file modes as fopen
-    # Probably should get rid of the backup options
+    # Updates the list of seen parsed crashes
     seen_crashes = open(".prev_files.db", "a")
     if len(crash_files) > GDB_PROCS:
         for procs in range(GDB_PROCS - 1, len(crash_files), GDB_PROCS):
@@ -237,13 +260,9 @@ if __name__ == "__main__":
                 exploitables[i] = exploitable
             except Exception as e:
                 logging.exception(e)
-                # print("Crashed with exception {}: ".format(e))
     
     pickle_fname = os.path.normpath(path)
     if "/" in path:
-        # Note: Python trick
-        # Find reverse index
-        # pickle_fname = path[len(path) - path[::-1].index('/'):]
         pickle_fname = pickle_fname.replace('/', "_")
         print("Pickled filename: {}".format(pickle_fname))
     with open("{}.pickle".format(pickle_fname), "wb") as cw_pickle:
