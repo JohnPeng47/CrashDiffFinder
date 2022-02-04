@@ -17,20 +17,22 @@ class ExploitableCallstack:
         with open(filename, "rb") as pickled:
             pickled_output = pickle.load(pickled)
 
+        print(len(pickled_output))
         for e in pickled_output:
-            # if e and e.exploitable:
-            # really dependent on this script to minimize false negatives
-            index = len(self.exploitables)
-            callstack_hash = e.get_call_hash(display_frames)
-            if not self.callstacks.get(callstack_hash):
-                self.callstacks[callstack_hash]["index"] = []
-                self.callstacks[callstack_hash]["callstack"] = e.get_callstack()[:display_frames]
-            self.callstacks[callstack_hash]["index"].append(index)
-            self.exploitables.append(e)
-            self.total_exploitables += 1
+            print(e.segfault)
+        #     # if e and e.exploitable:
+        #     # really dependent on this script to minimize false negatives
+        #     index = len(self.exploitables)
+        #     callstack_hash = e.get_call_hash(display_frames)
+        #     if not self.callstacks.get(callstack_hash):
+        #         self.callstacks[callstack_hash]["index"] = []
+        #         self.callstacks[callstack_hash]["callstack"] = e.get_callstack()[:display_frames]
+        #     self.callstacks[callstack_hash]["index"].append(index)
+        #     self.exploitables.append(e)
+        #     self.total_exploitables += 1
 
-        # callstacks.items() returns a 2-tuple instead
-        self.callstacks = sorted(self.callstacks.values(), key=lambda x: len(x["index"]), reverse=True)
+        # # callstacks.items() returns a 2-tuple instead
+        # self.callstacks = sorted(self.callstacks.values(), key=lambda x: len(x["index"]), reverse=True)
     
     def get_most_popular(self):
         return self.callstacks[0]
@@ -66,4 +68,4 @@ if __name__ == "__main__":
     filter = arguments.filter
 
     callstack = ExploitableCallstack(pickle_filename, frames)
-    callstack.pprint_crashing_callstacks()
+    # callstack.pprint_crashing_callstacks()

@@ -1,22 +1,59 @@
 # purpose of this is to incrementally make file b the same as a in order to isolate the bytes that
 # triggered the crash
+from ast import Str
+from inspect import Attribute
 import sys
 import shutil
 import subprocess
 from crashwalk import GDBJob, Exploitable, NoCrashException
 from callstack import ExploitableCallstack
-import ExploitableCallstack
 import argparse
 import os
 import logging
 import struct
 import math
+import glob
+import pickle
+# from utils import bytes_to_hex_str, hex_str_to_bytes, add_bytes
 
 # disable logging from pwn
 logging.getLogger("pwnlib").setLevel(logging.WARNING)
 
+# TODO move them to separate utils folder
+def bytes_to_hex_str(b: bytes, endianess="little")-> str:
+    hex_str = ""
+    b = b if endianess == "big" else b[::-1]
+    for byte in b:
+        hex_str += hex(byte).replace("0x","")
+    return "0x" + hex_str
+
+def hex_str_to_bytes(hex_bytes: str) -> bytes:
+    byte_str_array = [int(hex_bytes[i:i+2], 16) for i in range(0, len(hex_bytes)-1, 2)]
+    return bytes(byte_str_array)
+
+def add_bytes(a:int, b:int) -> int:
+    return (a + b) % 256
+
+def serialize_exploitables(path, exploitables):
+    pickle_fname = os.path.normpath(path)
+    if "/" in path:
+        # Note: Python trick
+        # Find reverse index
+        # pickle_fname = path[len(path) - path[::-1].index('/'):]
+        pickle_fname = pickle_fname.replace('/', "_")
+        print("Pickled filename: {}".format(pickle_fname))
+    with open("{}.pickle".format(pickle_fname), "wb") as cw_pickle:
+        # only exploitable crashes are going to be serialized
+        # exploitables = [e for e in exploitables if e != None and e.exploitable]
+        exploitables = [e for e in exploitables if e]
+        pickle.dump(exploitables, cw_pickle)
+
 class BinDiff:
-    def __init__(self, og_crash, pickle_filename, executable, debug=False):
+    def __init__(self, child_crash, parent_crash, executable, debug=False):
+        logging.basicConfig(filename='/tmp/bin_diff/{}'.format(child_crash[child_crash.rindex("/")]), level=logging.WARN)
+        self.log = []
+
+        self.no_diff = False
         self.debug = debug
         if self.debug:
             self.debug_dir = "/tmp/debug"
@@ -25,100 +62,111 @@ class BinDiff:
             except OSError:
                 print("Tmp directory already created, skipping")
 
-        self.filename = pickle_filename
-        self.og_crash = og_crash
+        self.parent_crash = parent_crash
+        self.child_crash = child_crash
         self.executable = executable
+        self.bytes_controlled = []
         try:
-            exploitable = GDBJob(executable, self.og_crash).generate_exploitable()
-            self.og_segfault = exploitable.segfault
+            exploitable = GDBJob(executable, self.child_crash).generate_exploitable()
+            self.child_sgsev = exploitable.segfault
+            exploitable = GDBJob(executable, self.parent_crash).generate_exploitable()
+            self.parent_sgsev = exploitable.segfault
+            if not self.child_sgsev or not self.parent_sgsev:
+                print("Either the child or the parent did not crash")
+                self.no_diff = True
+                return 
+            if self.child_sgsev == self.parent_sgsev:
+                print("Child segfault == Parent segfault, skipping {}".format(child_crash))
+                self.no_diff = True
+                return
         except Exception as e:
             logging.exception(e)
+        
+        # get bytes from diff
+        diff = []
+        for l in self.radiff2(self.child_crash, self.parent_crash):
+            try:
+                child_off, child_bytes, _, parent_bytes, parent_off = l.split(" ")
+                child_bytes = hex_str_to_bytes(child_bytes)
+                diff.append((int(parent_off, 16), child_bytes))
+            except Exception as e:
+                logging.exception(e)
 
-            # print("Crashed with exception {}: ".format(e))
-
-        callstack = ExploitableCallstack(pickle_filename, 1)
-        most_popular = callstack.get_most_popular()
-        # get list of crashing file names
-        crashing_files = [callstack.get_exploitable(i).crash_file for i in most_popular["index"]
-            if callstack.get_exploitable(i).segfault != self.og_segfault]
-
-        # get min crash
-        def get_diff_sz(crash_file):
-            diff_sz = 0
-            diff = self.radiff2(self.og_crash, crash_file)
-            print("Diff {} for {}".format(diff, crash_file))
-            for l in diff:
-                a_off, a_bytes, _, b_bytes, b_off = l.split(" ")
-                a_bytes = [int(a_bytes[i:i+2], 16) for i in range(0, len(a_bytes)-1, 2)]
-                diff_sz += len(a_bytes)
-            # Hack to handle the case when the og_file is included in the crashes
-            if diff_sz == 0:
-                print("OG file found in crash pickle, skipping...")
-                return 1000000
-            return diff_sz
-
-        for crash in crashing_files:
-            print(crash)
-
-        crashing_files.sort(key=get_diff_sz)
-        for crash_file in crashing_files:
-            print("File: ", crash_file)
-            offset, modified_bytes, modified_fname = self.get_crashing_offset(self.og_crash, crash_file)
-            self.find_control_width(offset, modified_bytes, modified_fname)
+        if len(diff) > 27:
+            print("{} diff too big, skipping {}".format(len(diff), child_crash))
+            self.no_diff = True
+            return
+        offset, modified_bytes, modified_fname = self.get_crashing_offset(self.parent_crash, diff)
+        if not modified_bytes:
+            print("Something wrong with: {}".format(self.child_crash))
+            for l in self.log:
+                logging.debug(l)
+            self.no_diff = True
+            return
+        if len(modified_bytes) > 12:
+            print("13 bytes or more")
+            self.no_diff = True
+            return
+        elif len(modified_bytes) <= 4:
+            print("4 bytes under")
+            self.linearity, self.bytes_controlled = self.find_control_width(offset, modified_bytes, modified_fname)
+            self.crash_offset = offset
+        elif len(modified_bytes) >= 5 and len(modified_bytes) < 12:
+            print("in between")
+            self.no_diff = True
+            return
+        
+    def get_crash_analysis(self):
+        try:
+            return self.linearity, self.bytes_controlled, self.crash_offset
+        except AttributeError:
+            return None, None, None
 
     def radiff2(self, a, b):
         res, err = subprocess.Popen(["radiff2", a, b], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).communicate()
         # remove extra line at the end of the file
         return res.decode('utf-8').split("\n")[:-1]
 
-    # how to handle case when a is bigger (more bytes) than b?
-    def get_crashing_offset(self, a, b):
-        modified_b = self.filename + ".modified"
-        diff = []
-        for l in self.radiff2(a,b):
-            try:
-                a_off, a_bytes, _, b_bytes, b_off = l.split(" ")
-                # since we are only concerned with making b crash with the same register values as a
-                # only store a's bytes and b's offset
-                # print((a_off, a_bytes))
-                a_bytes = [int(a_bytes[i:i+2], 16) for i in range(0, len(a_bytes)-1, 2)]
-                a_bytes = bytes(a_bytes)
-                diff.append((int(b_off, 16), a_bytes))
-            except Exception as e:
-                logging.exception(e)
-        # iteratively replace each byte until the endresult is the same
-        shutil.copyfile(b, modified_b)
-        tmp_b_handle = open(modified_b, "r+b")
+    # get the crashing file offset by flipping parent bytes to child bytes until the parent file gets the same
+    # crashing offset as the child
+    def get_crashing_offset(self, parent, diff):
+        print("crash_file: {} parent: {}".format(self.child_crash, parent))
+        modified_parent = self.child_crash + ".modified"        
+        # iteratively replace each byte in the parent crash until both parent and child crash with the same segfaulting address
+        shutil.copyfile(parent, modified_parent)
+        p_handle = open(modified_parent, "r+b")
         offset = None
         modified_bytes = None
-        for b_off, a_bytes in diff:
-            tmp_b_handle.seek(b_off)
+        for parent_off, child_bytes in diff:
+            p_handle.seek(parent_off)
             # write back old bytes after GDB call, so we don't make any inadvertent changes to execution trace
-            old_bytes = tmp_b_handle.read(len(a_bytes))
+            old_bytes = p_handle.read(len(child_bytes))
             # double seeking required since advance moves the file pointer
-            tmp_b_handle.seek(b_off)
-            tmp_b_handle.write(a_bytes)
-            tmp_b_handle.flush()
+            p_handle.seek(parent_off)
+            p_handle.write(child_bytes)
+            p_handle.flush()
 
-            print("writing {} at {}".format(a_bytes, b_off))
+            print("writing {} at {}".format(child_bytes, parent_off))
             # Run GDB to check segfaulting address
             try:
-                segfault_b = GDBJob(self.executable, modified_b).generate_exploitable().segfault
+                segfault_parent = GDBJob(self.executable, modified_parent).generate_exploitable().segfault
                 # tmp_b_handle.write(old_bytes)
             except Exception as e:
-                # print("Exception when parsing exploitable, continuing..".format(e))
                 logging.exception(e)
                 continue
-            if segfault_b == self.og_segfault:
-                print("Found crash triggering input fileoffset @ {}, segfaulting addr: {}".format(b_off, segfault_b))
-                offset = b_off
-                modified_bytes = a_bytes
+            # TODO: should log this 
+            self.log.append("child_crash: {}, segfault_parent: {}".format(self.child_sgsev, segfault_parent))
+            if segfault_parent == self.child_sgsev:
+                print("Found crash triggering input fileoffset @ {}, segfaulting addr: {}, parent crash original: {}"
+                    .format(parent_off, segfault_parent, self.parent_sgsev))
+                offset = parent_off
+                modified_bytes = child_bytes
                 break
-            # b = tmp_b_handle.read((len(a_bytes)))
-        tmp_b_handle.close()
-        return offset, modified_bytes, modified_b
+        p_handle.close()
+        return offset, modified_bytes, modified_parent
 
     def find_control_width(self, offset, mod_bytes, modified_file):
+        linearity = False
         # Test 1: subtract/add n bytes to the mod_bytes @ offset, then compare segfaulting addresses
         # to detect if linear relationship dexists
         test_file = "test_file"
@@ -131,6 +179,7 @@ class BinDiff:
             closest_segfaults = []
             POSSIBLE_DWORD_BYTE_POS = range(-3,4)
             bytes_controlled = [None] * 7
+            # iterate through each byte and infer the effect of modifying the byte on the final segfaulting address
             for i in POSSIBLE_DWORD_BYTE_POS:
                 byte_i = offset + i
                 modified_handle = open(modified_file, "rb+")
@@ -140,18 +189,12 @@ class BinDiff:
 
                 mod_byte_int = int.from_bytes(mod_byte, "little")
                 plus_one, plus_2, plus_3 =  [bytes([(mod_byte_int + i) % 256]) for i in range(1, 4)]
-                # Note:
-                # Do a check the range and see if hex bytes all fall within the range of integer digits (48 - 57)
 
-                # Numbers read from a file are also encoded
-                # means that for our test case to handle integer representations, we need read the integers byte by byte
-                # and then convert them to hex bytes via decoding, rather than using
-                # extract individual bytes from the integer representation
                 segfaults = []
                 inc_index = 0
                 for new_bytes in [plus_one, plus_2, plus_3]:
                     # new_bytes_i = bytes([new_bytes >> 8 * i & 0xFF for i in range(bytes_len)])
-                    print("writing {}".format(self.bytes_to_str(new_bytes)))
+                    print("writing {}".format(bytes_to_hex_str(new_bytes)))
                     modified_handle.seek(byte_i)
                     modified_handle.write(new_bytes)
                     modified_handle.flush()
@@ -165,16 +208,19 @@ class BinDiff:
                         # gdb.print_offset(offset)
                         segfault = gdb.generate_exploitable().segfault
                         segfaults.append(segfault)
-                        print("[*] offset: {}, mod_bytes: {}, og_segfault: {}, segfault: {}".format(byte_i, hex(int.from_bytes(new_bytes, "little")), self.og_segfault, segfault))
+                        print("[*] offset: {}, mod_bytes: {}, og_segfault: {}, segfault: {}".format(byte_i, hex(int.from_bytes(new_bytes, "little")), self.child_sgsev, segfault))
                     except NoCrashException as e:
                         # shouldnt really happen
+                        segfaults.append(9999999)
                         print("No crash on {} skipping!".format(i))
                         continue
 
                 # check results for a linear relationship
                 segfaults = [int(fault.replace("0x", ""), 16) for fault in segfaults]
+                # check if segfaults resulting from modifying the same byte remains the same ie. there is a linear relationship between that byte and the segfault
                 if (segfaults[2] - segfaults[1]) == (segfaults[1] - segfaults[0]) and ((segfaults[1] - segfaults[0]) != 0):
-                    segfault_delta = segfaults[2] - segfaults[1]
+                    linearity = True
+                    segfault_delta = abs(segfaults[2] - segfaults[1])
                     if segfault_delta:
                         byte_pos = int(math.log(int(segfault_delta),2) % 7)
                         bytes_controlled[i+3] = byte_pos
@@ -196,19 +242,8 @@ class BinDiff:
             print(hex(s))
 
         # Test 2: Random tests
-        return False
+        return linearity, bytes_controlled
 
-    # add one for hex bytes that wrap around 256
-    def add_wrap(self, a, b):
-        return (a + b) % 256
-
-    # utils
-    def bytes_to_str(self, b, endianess="little"):
-        hex_str = ""
-        b = b if endianess == "big" else b[::-1]
-        for byte in b:
-            hex_str += hex(byte).replace("0x","")
-        return "0x" + hex_str
 
 # Basic algorithm
 # 1. Find the most popular crash site
@@ -224,17 +259,102 @@ class BinDiff:
 # In the case where bytes could be transformed before accessed as memory (ie. some basic linear transformation), this strategy will not
 # be able to identify the crashing offset, since bytes in the crash could be very different than their representation in the input file
 # 5. Repeat with a less optimal crash file (reason for this may be due to complex operations)
-if __name__ == "__main__":
+
+def get_afl_queue_dir(crash_filepath):
+    crash_name = crash_filepath[crash_filepath.rindex("/") + 1:]
+    crash_dir = crash_filepath[:crash_filepath.rindex("/")]
+    parent_id = crash_name.split(",")[0]
+    queue_dir = os.path.join(crash_dir[:crash_dir.rindex("/")], "queue")
+
+def get_parent_id(crash_name):
+    # afl have different path delimiters
+    delimiters = [":", "_"]
+    parent_id = crash_name.split(",")[2]
+    for d in delimiters:
+        try:
+            return "id" + d + parent_id[parent_id.index(d)+1:]
+        except IndexError:
+            continue
+        except ValueError:
+            continue
+
+if __name__ == "__main__":    
     args = argparse.ArgumentParser()
-    args.add_argument("og_crash", help="The pickled file of Exploitables")
-    args.add_argument("pickle", help="The pickled file of Exploitables")
+    args.add_argument("crash_file", help="The AFL canonical crash file path ie. the filepath of the crash generated directly by AFL", nargs="?")
+    args.add_argument("--queue_dir", help="Directory of the afl queue")
     args.add_argument("--debug", help="DebugMode", action="store_true")
+    args.add_argument("--executable", help="The executable for the binary, can be set using the environment variable CRASHWALK_BINARY")
+    args.add_argument("--pickle_exploitables", help="A pickled file that holds a list of executables")
+
     arguments = args.parse_args()
     debug = arguments.debug
+    executable = arguments.executable
+    crash_file = arguments.crash_file
+    pickle_exploitables = arguments.pickle_exploitables
+    queue_dir = arguments.queue_dir
 
-    executable = os.environ["CRASHWALK_BINARY"] if os.environ["CRASHWALK_BINARY"] else None
-    pickle_filename = arguments.pickle
-    og_crash = arguments.og_crash
+    if not executable:
+        executable = os.environ["CRASHWALK_BINARY"] if os.environ["CRASHWALK_BINARY"] else None
 
-    BinDiff(og_crash, pickle_filename, executable, debug=debug)
+    # single crash file mode
+    if not pickle_exploitables:
+        if not os.path.isfile(crash_file):
+            print("Crash file does not exist or is a directoryr")
+            sys.exit(-1)
+        if not os.path.isabs(crash_file):
+            print("Absolute path is required")
+            sys.exit(-1)
+        # find parent queue_file, assuming that crash_file is a AFL canonical crash path
+        crash_name = crash_file[crash_file.rindex("/") + 1:]
+        crash_dir = crash_file[:crash_file.rindex("/")]
+        parent_id = get_parent_id(crash_name)
+        queue_dir = queue_dir if queue_dir else os.path.join(crash_dir[:crash_dir.rindex("/")], "queue")
+        try:
+            parent_file = glob.glob(os.path.join(queue_dir, parent_id + "*"))[0]
+        except IndexError:
+            print("Parent ID not found, check if queue_dir is specified corectly")
+            sys.exit()
 
+        diff = BinDiff(crash_file, parent_file, executable, debug=debug)
+        linearity, affected_bytes, crash_offset = diff.get_crash_analysis()
+        print(linearity, affected_bytes, crash_offset)
+        sys.exit()
+
+    # multiple crashes serialized into pickle mode
+    new_exploitables = []
+    try:
+        with open(pickle_exploitables, "rb") as pickled:
+            exploitables = pickle.load(pickled)
+            for e in exploitables:
+                crash_file = e.crash_file
+                crash_name = crash_file[crash_file.rindex("/") + 1:]
+                crash_dir = crash_file[:crash_file.rindex("/")]
+                # grab the queue src id from crash name
+                # ie. id:000136,sig:11,src:000642,time:5534110,op:havoc,rep:4.pickle
+                # TODO: what if you have more than 100k files in the queue
+                parent_id = get_parent_id(crash_name)
+                # queue_dir needs to be manually specified if the crash_file isn't using AFL's canonical crash path
+                queue_dir = queue_dir if queue_dir else os.path.join(crash_dir[:crash_dir.rindex("/")], "queue")
+                try:
+                    parent_file = glob.glob(os.path.join(queue_dir, parent_id + "*"))[0]
+                except IndexError:
+                    print("Parent ID not found, check if queue_dir is specified correctly")
+                    sys.exit()
+                diff = BinDiff(crash_file, parent_file, executable, debug=debug)
+                linearity, affected_bytes, crash_offset = diff.get_crash_analysis()
+                if not linearity:
+                    e.set_linearity(None)
+                    e.set_crash_bytes(None)
+                    e.set_crash_offset(None)
+
+                e.set_linearity(linearity)
+                e.set_crash_bytes(affected_bytes)
+                e.set_crash_offset(crash_offset)
+                new_exploitables.append(e)
+
+    except KeyboardInterrupt:
+        with open(pickle_exploitables + ".bin_diff", "wb") as write_pickled:
+            write_pickled.write(pickle.dumps(new_exploitables))    
+
+    with open(pickle_exploitables + ".bin_diff", "wb") as write_pickled:
+        write_pickled.write(pickle.dumps(new_exploitables))    

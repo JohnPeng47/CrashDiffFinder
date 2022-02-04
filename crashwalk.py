@@ -31,7 +31,6 @@ class GDBJob:
         self.timedout = False
         exploitable_path = "/mnt/c/Users/pengjohn/Documents/tools/exploit/exploitable/exploitable/exploitable.py"
         if env_exploitable := os.environ.get("EXPLOITABLE_PATH", None):
-            print("Using EXPLOITABLE path from environment")
             self.exploitable_path = env_exploitable
         context.log_level = "error"
         gdb = process(["gdb", "--args", proc_name, filename], stdin=process.PTY, stdout=process.PTY, timeout=timeout)
@@ -146,14 +145,14 @@ class Exploitable:
             print(descr)
         print("Segmentation Fault: ", self.segfault)
 
-    def print_results(self):
-        for line in self.disassembly:
-            print(line)
-        for line in self.get_callstack():
-            print(line)
-        for line in self.stack_trace[:self.callstack_lines]:
-            print(line)
-        print(self.segfault)
+    def set_linearity(self, linearity):
+        self.linearity = linearity
+
+    def set_crash_offset(self, crash_offset):
+        self.crash_offset = crash_offset
+    
+    def set_crash_bytes(self, crash_bytes):
+        self.crash_bytes = crash_bytes
 
 # threading
 def run_GDBWorker(filepath, i):
@@ -162,29 +161,55 @@ def run_GDBWorker(filepath, i):
     global run_status
     try:
         exploitable = GDBJob(executable, filepath).generate_exploitable()
-        exploitable.print_raw()
         # why doesn't python complain about explotiables not being declared as global variable
         exploitables[i] = exploitable
-        exploitable.print_raw()
+        # exploitable.print_raw()
         run_status[i] = 1
         PROC_NUM -= 1
-    except Exception as e:
-        logging.exception(e)
+        return
+    except NoCrashException as e:
+        print("No crash")
         # print("Crashed in: ".format(e))
         run_status[i] = 2
+    finally:
+        print("File: {}".format(filepath))
+        PROC_NUM -= 1
 
+
+def get_pickle_fname(pickle_path):
+    pickle_fname = os.path.normpath(pickle_path)
+    if "/" in pickle_fname:
+        pickle_fname = pickle_fname.replace('/', "_")
+    return pickle_fname
+
+def write_pickle(pickle_name, exploitables):
+    with open("{}".format(pickle_name), "wb") as cw_pickle:
+        # only exploitable crashes are going to be serialized
+        # exploitables = [e for e in exploitables if e != None and e.exploitable]
+        exploitables = [e for e in exploitables if e]
+        pickle.dump(exploitables, cw_pickle)
+
+    seen_crashes.close()
 if __name__ == "__main__":
     argParse = argparse.ArgumentParser()
     argParse.add_argument("--executable", help="Path to the executable, if not provided via cmdline, will be read from CRASHWALK_BINARY env variable")
-    argParse.add_argument("path", help="Path to the crash file, if relative path given, then must be ")
+    argParse.add_argument("path", help="Path to the crash file")
+    argParse.add_argument("--pickle-name", help="Optionally specify the name of the pickle file")
 
     arguments = argParse.parse_args()
-    executable = arguments.executable if arguments.executable else os.environ["CRASHWALK_BINARY"]
+    
+    try:
+        executable = arguments.executable if arguments.executable else os.environ["CRASHWALK_BINARY"]
+    except KeyError:
+        print("Please specify the executable binary via env variables or cmd line arguments")
+        sys.exit(-1)
+    pickle_name = arguments.pickle_name
     path = arguments.path
 
     GDB_PROCS = multiprocessing.cpu_count()
     PROC_NUM = 0
     crash_files = [path]
+
     # no recursive search for crash files and all files present are crash files
     if os.path.isdir(path):
         crash_files = glob.glob(os.path.join(path, "*"))
@@ -195,61 +220,68 @@ if __name__ == "__main__":
     # updates the exit status of the GDB job: 1 for success, 2 for an exception raised
     run_status = [0] * len(crash_files)
 
-    try:
-        # read files previously seen files and skip them
-        seen_crashes = [s.strip() for s in open(".prev_files.db", "r").readlines()]
-        crash_files = [crash for crash in crash_files if crash not in seen_crashes]
-        print("Restarting, using {}, {}/{} files to look through".format(crash_files[0], len(crash_files), total_files))
-    except FileNotFoundError as e:
-        pass
+    # try:
+    #     # read files previously seen files and skip them
+    #     seen_crashes = [s.strip() for s in open(".prev_files.db", "r").readlines()]
+    #     crash_files = [crash for crash in crash_files if crash not in seen_crashes]
+    #     print("Restarting, using {}, {}/{} files to look through".format(crash_files[0], len(crash_files), total_files))
+    # except FileNotFoundError as e:
+    #     pass
+    # except IndexError:
+    #     print("{} already processed in previous run")
+    #     sys.exit(-1)
 
     threads = []
     # https://stackoverflow.com/questions/1466000/difference-between-modes-a-a-w-w-and-r-in-built-in-open-function
     # FYI Python uses same file modes as fopen
     # Probably should get rid of the backup options
-    seen_crashes = open(".prev_files.db", "a")
-    if len(crash_files) > GDB_PROCS:
-        for procs in range(GDB_PROCS - 1, len(crash_files), GDB_PROCS):
-            for i in range(procs - GDB_PROCS + 1, procs + 1):
-                filepath = crash_files[i]
-                while PROC_NUM > GDB_PROCS:
-                    sleep(1)
-                PROC_NUM += 1
-                t = threading.Thread(target=run_GDBWorker, args=(filepath, i, ))
-                threads.append((t, filepath))
-                t.start()       
-            # check to make sure all of the threads have been ran. Can think of this as a join for all of the threads in [proc-GDB_PROCS +1: procs +1]
-            # Blocks main thread execution until all the threads have written to file
-            while len(list(filter(lambda x: x == 1 or x == 2, run_status[procs - GDB_PROCS + 1:procs + 1]))) < GDB_PROCS:
-                sleep(1)
-            try:
-                seen_crashes.write(filepath + '\n')
-                print("Persisting ", filepath)
-            except IndexError:
-                print("End of crash_files reached")
-                # probably going to get index error when the GDB_PROCS exceed the of crash_files
-                break
-    else:
-        for i, c in enumerate(crash_files):
-            try:
-                exploitable = GDBJob(executable, c).generate_exploitable()
-                exploitable.print_raw()
-                exploitables[i] = exploitable
-            except Exception as e:
-                logging.exception(e)
-                # print("Crashed with exception {}: ".format(e))
-    
-    pickle_fname = os.path.normpath(path)
-    if "/" in path:
-        # Note: Python trick
-        # Find reverse index
-        # pickle_fname = path[len(path) - path[::-1].index('/'):]
-        pickle_fname = pickle_fname.replace('/', "_")
-        print("Pickled filename: {}".format(pickle_fname))
-    with open("{}.pickle".format(pickle_fname), "wb") as cw_pickle:
-        # only exploitable crashes are going to be serialized
-        # exploitables = [e for e in exploitables if e != None and e.exploitable]
-        exploitables = [e for e in exploitables if e]
-        pickle.dump(exploitables, cw_pickle)
+    try:
+        seen_crashes = open(".prev_files.db", "a")
+        if len(crash_files) > GDB_PROCS:
+            for procs in range(GDB_PROCS - 1, len(crash_files), GDB_PROCS):
+                for i in range(procs - GDB_PROCS + 1, procs + 1):
+                    print(PROC_NUM)
+                    filepath = crash_files[i]
+                    while PROC_NUM > GDB_PROCS:
+                        sleep(1)
+                    PROC_NUM += 1
+                    t = threading.Thread(target=run_GDBWorker, args=(filepath, i, ))
+                    threads.append((t, filepath))
+                    t.start()
+                
+                # check to make sure all of the threads have been ran. Can think of this as a join for all of the threads in [proc-GDB_PROCS +1: procs +1]
+                # Blocks main thread execution until all the threads have written to file
+                # Figure out what happens here if threads are not joined .. competing for limited CPUs?
 
-    seen_crashes.close()
+                # 36-38 GDB procs without the following line vss 8-9 with the following line
+                # thought PROC_NUM (int) is thread safe in python?
+                for t in threads:
+                    t[0].join()
+
+
+                # while len(list(filter(lambda x: x == 1 or x == 2, run_status[procs - GDB_PROCS + 1:procs + 1]))) < GDB_PROCS:
+                #     sleep(1)
+                # try:
+                #     seen_crashes.write(filepath + '\n')
+                #     print("Persisting ", filepath)
+                # except IndexError:
+                #     print("End of crash_files reached")
+                #     # probably going to get index error when the GDB_PROCS exceed the of crash_files
+                #     break
+        else:
+            for i, c in enumerate(crash_files):
+                try:
+                    exploitable = GDBJob(executable, c).generate_exploitable()
+                    print(exploitable._output)
+                    exploitable.print_raw()
+                    exploitables[i] = exploitable
+                except Exception as e:
+                    logging.exception(e)
+    except KeyboardInterrupt:
+        if not pickle_name:
+            pickle_name = get_pickle_fname(path)
+        write_pickle(pickle_name, exploitables)
+
+    if not pickle_name:
+        pickle_name = get_pickle_fname(path)
+    write_pickle(pickle_name, exploitables)
