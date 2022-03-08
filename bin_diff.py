@@ -21,6 +21,7 @@ import re
 from multiprocessing import cpu_count
 from typing import List
 import datetime
+import queue
 
 # from utils import bytes_to_hex_str, hex_str_to_bytes, add_bytes
 
@@ -28,6 +29,28 @@ import functools
 import time
 
 GDB_PROCS = cpu_count()
+
+class CustomThreadPoolExecutor(ThreadPoolExecutor):
+    def shutdown(self, wait=True, *, cancel_futures=False):
+        with self._shutdown_lock:
+            self._shutdown = True
+            if cancel_futures:
+                # Drain all work items from the queue, and then cancel their
+                # associated futures.
+                while True:
+                    try:
+                        work_item = self._work_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if work_item is not None:
+                        work_item.future.cancel()
+
+            # Send a wake-up to prevent threads calling
+            # _work_queue.get(block=True) from permanently blocking.
+            self._work_queue.put(None)
+        if wait:
+            for t in self._threads:
+                t.join()
 
 class Timer:
     def __init__(self):
@@ -59,27 +82,25 @@ def runGDBJob(filepath):
         print("No crash")
 
 @t.timer
-def replaceBytes(parent, modified_parent, diff):
+def replaceBytes(parent, modified_parent, offset, bytes):
     res = shutil.copyfile(parent, modified_parent)
     print("res: ", res, "modified: ", modified_parent)
-    with open(modified_parent, "w+b") as file_handle:
+    with open(modified_parent, "r+b") as file_handle:
         # TODO:
         # write back old bytes after GDB call, so we don't make any inadvertent changes to execution trace
         # old_bytes = file_handle.read(len(bytes))
         # double seeking required since advance moves the file pointer
-        for offset, bytes in diff:
-            file_handle.seek(offset)
-            print("Writing {} at {}".format(bytes, offset))
-            b = file_handle.write(bytes)
-            if b != len(bytes):
-                return False
-
+        file_handle.seek(offset)
+        print("Writing {} at {} @ file: {}".format(bytes, offset, modified_parent))
+        b = file_handle.write(bytes)
+        if b != len(bytes):
+            return False
         file_handle.flush()
         return True
 
 class GDBExecutor:
     def __init__(self):
-        self.t_pool = ThreadPoolExecutor(max_workers=GDB_PROCS)
+        self.t_pool = CustomThreadPoolExecutor(max_workers=GDB_PROCS)
     
     def run_jobs(self, crashes):
         jobs = []
@@ -124,7 +145,6 @@ class BinDiff:
     def __init__(self, child_crash, parent_crash, executable, debug=False):
         logging.basicConfig(filename='/tmp/bin_diff/{}'.format(child_crash[child_crash.rindex("/")]), level=logging.WARN)
         self.log = []
-
         self.no_diff = False
         self.debug = debug
         if self.debug:
@@ -170,6 +190,7 @@ class BinDiff:
         diff = diff_crash(child_crash, parent_crash)
         # find crashing offset
         offset, modified_bytes, modified_parent = self.get_crashing_offset(parent_crash, diff)
+        linearity, bytes_controlled = self.find_control_width(offset, modified_bytes, modified_parent)
 
     def get_crash_analysis(self):
         try:
@@ -179,7 +200,7 @@ class BinDiff:
 
     def get_crashing_offset(self, parent, diff):
         child_file = self.child_crash[self.child_crash.rindex("/") + 1:]
-        t_pool = ThreadPoolExecutor(max_workers=GDB_PROCS)
+        t_pool = CustomThreadPoolExecutor(max_workers=GDB_PROCS)
         pending_futures = []
         modified_parents = {}
         # copy a newly modified file for each line in the diff
@@ -195,29 +216,29 @@ class BinDiff:
                 sys.exit()
 
         # execute subprocesses to determine which diff lines crashes the input
-        finished = False
-        for l in modified_parents.keys():
-            print(l)
         future_jobs = self.executor.run_jobs(modified_parents.keys())
-        for f in future_jobs:
-            if finished:
-                print('Cancelling..')
-                f.cancel()
-            res = f.result()
-            parent_sgsev = res.segfault
-            parent_crash = res.crash_file
-            try:
+        try:
+            for f in future_jobs:
+                # Attempt #1:
+                # this doesn't work because all futures are iterated for in the beginning, without the chance for one to complete execution
+                # if finished:
+                #     print('Cancelling..')
+                #     t_pool.shutdown(wait=False)
+                res = f.result()
+                parent_sgsev = res.segfault
+                parent_crash = res.crash_file
                 if parent_sgsev == self.child_sgsev:
-                    finished = True
                     print("PARENT CRASH: >>>>> ", res.crash_file)
                     offset = modified_parents[parent_crash][0]
                     modified_bytes = modified_parents[parent_crash][1]
                     print("Found crash triggering input fileoffset @ {}, segfaulting addr: {}, parent crash original: {}"
                         .format(offset, parent_sgsev, parent_crash))
-                    break
-            except KeyError:
-                finished = False
-                continue
+                    raise ValueError
+        # Attempt #2: This will execute unlike attempt #1, but will not cancel pending jobs
+        # wait=False just allows the function to return earlier rather than waiting for completion, but neither cancels pending jobs
+        except ValueError:
+            print("Canceling")
+            t_pool.shutdown(wait=True, cancel_futures=True)
         
         return offset, modified_bytes, parent_crash
 
@@ -275,7 +296,7 @@ class BinDiff:
             closest_segfaults = []
             POSSIBLE_DWORD_BYTE_POS = range(-3,4)
             bytes_controlled = [None] * 7
-            # iterate through each byte and infer the effect of modifying the byte on the final segfaulting address
+            # iterate through each byte and observe the effect of modifying the byte on the final segfaulting address
             for i in POSSIBLE_DWORD_BYTE_POS:
                 byte_i = offset + i
                 modified_handle = open(modified_file, "rb+")
@@ -355,15 +376,13 @@ class BinDiff:
 # In the case where bytes could be transformed before accessed as memory (ie. some basic linear transformation), this strategy will not
 # be able to identify the crashing offset, since bytes in the crash could be very different than their representation in the input file
 # 5. Repeat with a less optimal crash file (reason for this may be due to complex operations)
+
+# TODO: USE THIS FUNCTION
 def get_afl_queue_dir(crash_filepath):
     crash_name = crash_filepath[crash_filepath.rindex("/") + 1:]
     crash_dir = crash_filepath[:crash_filepath.rindex("/")]
     parent_id = crash_name.split(",")[0]
     queue_dir = os.path.join(crash_dir[:crash_dir.rindex("/")], "queue")
-
-def get_parents(crash_name, queue_dir):
-    parent_id = get_parent_id(crash_name)
-    parent_fname = glob.glob()
 
 # handle
 def get_parent_id(crash_file):
@@ -394,23 +413,24 @@ def get_ancestor_crashes(crash_name, queue_dir, ancestor_tree:list):
     # we have reached the end of the parent tree
     if not parent_id:
         return
-    # print("parent_id", parent_id, "crash_name: ", crash_name)
     # queue_dir needs to be manually specified if the crash_file isn't using AFL's canonical crash path
     try:
         parent = glob.glob(os.path.join(queue_dir, parent_id + "*"))[0]
         ancestor_tree.append(parent)
         return get_ancestor_crashes(parent, queue_dir, ancestor_tree)
     except IndexError:
+        print("IndexError", ancestor_tree)
         return
 
-def find_closest_ancestor(ancestors):
+def find_closest_ancestor(crash_file, ancestors):
+    print(crash_file)
     diff_len = 99999999999
     closest_ancestor = ancestors[0]
     for ancestor_crash in ancestors:
         # get bytes from diff
         #TODO: reimplement radiff in python
         diff = diff_crash(crash_file, ancestor_crash)
-
+        print(len(diff), ancestor_crash)
         if len(diff) < diff_len:
             diff_len = len(diff)
             print("Closest ancestor: ", ancestor_crash, "diff_bytes: ", len(diff))
@@ -433,7 +453,7 @@ def diff_crash(crash_file, ancestor_crash):
 if __name__ == "__main__":
     args = argparse.ArgumentParser()
     args.add_argument("crash_file", help="The AFL canonical crash file path ie. the filepath of the crash generated directly by AFL", nargs="?")
-    args.add_argument("--queue", help="Directory of the afl queue")
+    args.add_argument("--queue", help="Directory of the afl queue", required=True)
     args.add_argument("--debug", help="DebugMode", action="store_true")
     args.add_argument("--executable", help="The executable for the binary, can be set using the environment variable CRASHWALK_BINARY")
     args.add_argument("--pickle", help="(IMPORTANT: This is the most used mode) A pickled file that holds a list of executables")
@@ -447,7 +467,7 @@ if __name__ == "__main__":
     executable = arguments.executable
     crash_file = os.path.abspath(arguments.crash_file) if arguments.crash_file else None
     pickle_exploitables = os.path.abspath(arguments.pickle) if arguments.pickle else None
-    queue_dir = arguments.queue
+    queue_dir = os.path.abspath(arguments.queue) if arguments.queue else None
 
     print(default_usage)
     start = datetime.datetime.now()
@@ -487,35 +507,39 @@ if __name__ == "__main__":
     with open(pickle_exploitables, "rb") as pickled:
         exploitables = pickle.load(pickled)
         for e in exploitables:
-            crash = os.path.abspath(e.crash_file)
-            crash_name = crash[crash.rindex("/") + 1:]
-            crash_dir = crash[:crash.rindex("/")]
-            # grab the queue src id from crash name
-            # ie. id:000136,sig:11,src:000642,time:5534110,op:havoc,rep:4.pickle
-            # TODO: what if you have more than 100k files in the queue
-            ancestors = []
-            queue_dir = queue_dir if queue_dir else os.path.join(crash_dir[:crash_dir.rindex("/")], "queue")
-            get_ancestor_crashes(crash_name, queue_dir, ancestors)
-            parent = ancestors[0]
-
-            # find ancestor with the smallest diff; the immediate parent is not guranteed to be the smallest diff
-            # Actually, maybe we dont want to do this, since the ancestor crashes may not have directly led to our crash
-            # find_closest_ancestor()
             try:
-                diff = BinDiff(crash, parent, executable, debug=debug)
+                crash_file = os.path.abspath(e.crash_file)
+                crash_name = crash_file[crash_file.rindex("/") + 1:]
+                crash_dir = crash_file[:crash_file.rindex("/")]
+                print("crash_file", crash_file)
+                # grab the queue src id from crash name
+                # ie. id:000136,sig:11,src:000642,time:5534110,op:havoc,rep:4.pickle
+                # TODO: what if you have more than 100k files in the queue
+                ancestors = []
+                queue_dir = queue_dir if queue_dir else os.path.join(crash_dir[:crash_dir.rindex("/")], "queue")
+                get_ancestor_crashes(crash_name, queue_dir, ancestors)
+                parent = ancestors[0]
+
+                # find ancestor with the smallest diff; the immediate parent is not guranteed to be the smallest diff
+                # Actually, maybe we dont want to do this, since the ancestor crashes may not have directly led to our crash
+                # find_closest_ancestor(crash_file, ancestors)
+
+                try:
+                    diff = BinDiff(crash_file, parent, executable, debug=debug)
+                except Exception:
+                    pass
+                linearity, affected_bytes, crash_offset = diff.get_crash_analysis()
+                if not linearity:
+                    e.set_linearity(None)
+                    e.set_crash_bytes(None)
+                    e.set_crash_offset(None)
+
+                e.set_linearity(linearity)
+                e.set_crash_bytes(affected_bytes)
+                e.set_crash_offset(crash_offset)
+                new_exploitables.append(e)
             except Exception:
-                pass
-            # linearity, affected_bytes, crash_offset = diff.get_crash_analysis()
-            # if not linearity:
-            #     e.set_linearity(None)
-            #     e.set_crash_bytes(None)
-            #     e.set_crash_offset(None)
-
-            # e.set_linearity(linearity)
-            # e.set_crash_bytes(affected_bytes)
-            # e.set_crash_offset(crash_offset)
-            # new_exploitables.append(e)
-
+                continue
 
     with open(pickle_exploitables + ".bin_diff", "wb") as write_pickled:
         write_pickled.write(pickle.dumps(new_exploitables))
