@@ -20,7 +20,7 @@ class ExploitableCallstack:
         print(len(pickled_output))
         for e in pickled_output:
             print(e.segfault)
-        #     # if e and e.exploitable:
+        #     # if e and e.exploitable:     
         #     # really dependent on this script to minimize false negatives
         #     index = len(self.exploitables)
         #     callstack_hash = e.get_call_hash(display_frames)
