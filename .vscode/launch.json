@@ -6,7 +6,7 @@
             "type": "python",
             "request": "launch",
             "program": "${file}",
-            "args": ["/mnt/c/Users/pengjohn/Documents/umbra/umbra3/crashwalk_test/id:000547,sig:11,src:004655,time:65136850,op:havoc,rep:16", "--queue", "/mnt/c/Users/pengjohn/Documents/umbra/umbra3/fuzz/output/default/queue"],
+            "args": ["--pickle", "/mnt/c/Users/pengjohn/Documents/umbra/umbra3/crashwalk_test03-13-2022_18_43_26.pickle", "--queue", "/mnt/c/Users/pengjohn/Documents/umbra/umbra3/fuzz/output/default/queue"],
             "console": "integratedTerminal",
         }
     ]

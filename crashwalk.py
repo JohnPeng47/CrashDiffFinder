@@ -47,6 +47,8 @@ class TimeoutException(Exception):
     pass
 class NoCrashException(Exception):
     pass
+class CrashwalkError(Exception):
+    pass
 
 # TODO: should not have written this as two separate classes
 class GDBJob:
@@ -87,7 +89,7 @@ class GDBJob:
             return
         # check if process actually crashed
         for line in self.output:
-            if "exited normally" in line:
+            if "exited normally" in line or "exited with" in line:
                 self.crashed = False
 
     def send(self, actions, gdb):
@@ -101,32 +103,42 @@ class GDBJob:
         elif self.timedout == True:
             print("{} timed out".format(self.filename))
             raise TimeoutException
+        elif not self.output:
+            print("no output")
+            raise Exception
         return Exploitable(self.output, self.filename)
 
 class Exploitable:
     def __init__(self, output, crash_file):
-        START_PARSE = "---START_HERE---"
-        self.classification = []
-        self.exploitable = False
-        self.crash_file = crash_file
-        self._output = iter(output)
-        self.raw_output = output
-        not_start = True
-        line = next(self._output, None)
-        while line or not_start:
-            if f"{START_PARSE}" in line:
-                not_start = False
-            if "Nearby code:" in line:
-                self.disassembly, line = self.parse_until("Stack trace:")
-                # Dont need this line since the iterator from the prev parse_until call will consume this line
-                # if "Stack trace:" in line:
-                self.stack_trace, line = self.parse_until("Faulting frame:")
-                self.faulting_frame = line.split(" ")[5]
-            if "Description:" in line:
-                self.classification, line = self.parse_until("gef")
-            if "SegfaultAddy" in line:
-                self.segfault = self.parse_segfault()
+        try:
+            START_PARSE = "---START_HERE---"
+            self.classification = []
+            self.exploitable = False
+            self.crash_file = crash_file
+            self._output = iter(output)
+            self.raw_output = output
+            not_start = True
             line = next(self._output, None)
+            while line or not_start:
+                if f"{START_PARSE}" in line:
+                    not_start = False
+                if "Nearby code:" in line:
+                    self.disassembly, line = self.parse_until("Stack trace:")
+                    # Dont need this line since the iterator from the prev parse_until call will consume this line
+                    # if "Stack trace:" in line:
+                    self.stack_trace, line = self.parse_until("Faulting frame:")
+                    self.faulting_frame = line.split(" ")[5]
+                if "Description:" in line:
+                    self.classification, line = self.parse_until("gef")
+                if "SegfaultAddy" in line:
+                    self.segfault = self.parse_segfault()
+                line = next(self._output, None)
+            self.assert_correctness()
+        except Exception:
+            print(f"Crashwalk error, self.output: ")
+            for l in self.raw_output:
+                print(l)
+            raise CrashwalkError
 
     def parse_segfault(self):
         segfault = next(self._output, None)
@@ -159,6 +171,11 @@ class Exploitable:
 
     def get_callstack_raw(self):
         return self.stack_trace
+
+    def assert_correctness(self):
+        assert self.disassembly
+        assert self.get_callstack_raw()
+        assert self.classification
 
     # output functions
     def print_raw(self):
@@ -211,6 +228,7 @@ if __name__ == "__main__":
     argParse.add_argument("--executable", help="Path to the executable, if not provided via cmdline, will be read from CRASHWALK_BINARY env variable")
     argParse.add_argument("path", help="Path to the crash file")
     argParse.add_argument("--pickle-name", help="Optionally specify the name of the pickle file")
+    argParse.add_argument("--verbose", help="Print output to stdout", action="store_true")
 
     arguments = argParse.parse_args()
 
@@ -221,6 +239,7 @@ if __name__ == "__main__":
         sys.exit(-1)
     pickle_name = arguments.pickle_name
     path = arguments.path
+    verbose = arguments.verbose if arguments.verbose else False
 
     GDB_PROCS = multiprocessing.cpu_count()
     crash_files = [path]
@@ -259,6 +278,8 @@ if __name__ == "__main__":
             # https://stackoverflow.com/questions/51239251/how-does-concurrent-futures-as-completed-work
             for future in as_completed(pending_futures):
                 exploitable = future.result()
+                if verbose:
+                    exploitable.print_raw()
                 exploitables.append(future.result())
 
     except KeyboardInterrupt:
