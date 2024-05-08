@@ -1,1 +1,1 @@
-"ubeogoiw" 
+print('hello world')
